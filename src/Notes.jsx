@@ -13,7 +13,22 @@ const SECS = ['quotes', 'vocab'];
 const lsOf = (t, p) => t.lastIndexOf('\n', p - 1) + 1;
 const leOf = (t, p) => { const i = t.indexOf('\n', p); return i < 0 ? t.length : i; };
 const firstNBOf = (t, p) => { let i = lsOf(t, p); const e = leOf(t, p); while (i < e && /[ \t]/.test(t[i])) i++; return i; };
+// `:git commit -m testing git` without quotes: the words after -m are the message, up to the next flag (git would read them as paths)
+const commitMsg = (args, raw) => { const i = args.findIndex(a => /^(-[a-zA-Z]*m|--message)$/.test(a)); if (args[0] !== 'commit' || i < 0 || /\s(-[a-zA-Z]*m|--message)\s+["']/.test(raw)) return args; let j = i + 1; while (j + 1 < args.length && !args[j + 1].startsWith('-')) j++; return [...args.slice(0, i + 1), args.slice(i + 1, j + 1).join(' '), ...args.slice(j + 1)]; };
+// one line out of a git run for the status bar: the first useful line of stdout (stderr on failure), status/log/push shaped by hand
+const gitSummary = ({ args, out, err, code }) => {
+  const first = str => (str || '').split('\n').map(l => l.trim()).filter(l => l && !/^(To |remote:|hint:|warning:)/i.test(l))[0] || '';
+  if (code !== 0) return first(err) || first(out) || `exit ${code}`;
+  const lines = out.split('\n').filter(l => l.trim());
+  if (args[0] === 'status' && lines[0] && lines[0].startsWith('## ')) { const n = lines.length - 1; return `${lines[0].slice(3)} · ${n ? n + (n === 1 ? ' change' : ' changes') : 'clean'}`; }
+  if (args[0] === 'status') return /nothing to commit/.test(out) ? 'clean' : `${lines.filter(l => /^\s+(modified|new file|deleted|renamed):|^\?\?/.test(l)).length || '?'} changes`;
+  if (args[0] === 'log') return lines.length ? `${lines[0]}${lines.length > 1 ? ` · ${lines.length} shown` : ''}` : 'no commits';
+  if (args[0] === 'push' || args[0] === 'pull' || args[0] === 'fetch') return first(err.replace(/^\s*[0-9a-f]+\.\.[0-9a-f]+\s+/m, '')) || first(out) || 'ok';
+  return first(out) || first(err) || 'ok';
+};
 const VMODES = { normal: 'NORMAL', insert: 'INSERT', visual: 'VISUAL', vline: 'V-LINE' };
+// shell-style argument split for :git — quotes group words, backslash escapes inside them: commit -m "a message"
+const splitArgs = str => { const out = []; let cur = null, q = null; for (let i = 0; i < str.length; i++) { const ch = str[i]; if (q) { if (ch === q) q = null; else if (ch === '\\' && q === '"' && i + 1 < str.length) cur += str[++i]; else cur += ch; } else if (ch === '"' || ch === "'") { q = ch; cur = cur ?? ''; } else if (/\s/.test(ch)) { if (cur !== null) { out.push(cur); cur = null; } } else if (ch === '\\' && i + 1 < str.length) cur = (cur ?? '') + str[++i]; else cur = (cur ?? '') + ch; } if (cur !== null) out.push(cur); return out; };
 // text objects: iw aw iW aW ip ap and the bracket / quote pairs → [start, end) or null
 const OBJ_PAIRS = { '(': '()', ')': '()', b: '()', '[': '[]', ']': '[]', '{': '{}', '}': '{}', B: '{}', '<': '<>', '>': '<>', '"': '""', "'": "''", '`': '``' };
 const charClass = ch => /\s/.test(ch) ? 0 : /[\p{L}\p{N}_]/u.test(ch) ? 1 : 2;
@@ -60,9 +75,10 @@ export default class Notes extends React.Component {
       books: data || seed(), theme: ui.theme || p.theme || 'light', sidebar: ui.sidebar ?? (p.sidebarOpen ?? true), nu: ui.nu ?? true,
       view: { type: 'library' }, cur: 0, side: 0, expanded: ui.expanded || {}, focus: 'main', mode: 'normal', pending: '', count: '',
       cmd: '', search: '', filter: '', msg: '', vanchor: null, long: null, longText: '', help: false,
-      hover: null, aiBusy: null, archive: null, archiveState: '',
+      hover: null, aiBusy: null, archive: null, archiveState: '', git: { busy: null }, cmdc: 0, histIdx: null, histDraft: '', fields: null,
     };
     this.undo = []; this.longRef = React.createRef(); this.mirrorRef = React.createRef();
+    try { this.hist = JSON.parse(localStorage.getItem('notes.hist.v1')) || []; } catch (e) { this.hist = []; }
   }
   componentDidMount() {
     this.onKey = e => this.key(e); this.onCopy = e => this.copy(e); this.onPaste = e => this.paste(e);
@@ -167,6 +183,33 @@ export default class Notes extends React.Component {
     if (r.kind === 'quote') return this.setState({ ...base, view: { type: 'thread', bookId: bk.id, quoteId: qq.id }, cur: 0 });
     return this.setState({ ...base, view: { type: 'thread', bookId: bk.id, quoteId: qq.id }, cur: Math.max(0, flatThoughts(qq).findIndex(x => x.t.id === r.id)) });
   }
+  // ---- git: `:git <args>` runs git inside the archive folder through the dev server (POST /api/git). Nothing opens: the
+  // result is one line in the status bar, `git <cmd> · ok · <first line>` or `git <cmd> · failed · <first error line>`.
+  // `:commit [msg]` is add + commit + push in one go. Commands that change the working tree reload the archive afterwards.
+  async runGit(args, opts = {}) {
+    const s = this.state;
+    if (!s.archive) { this.setState({ msg: 'no archive · git needs the dev server' }); return null; }
+    if (s.git.busy) { this.setState({ msg: `git ${s.git.busy} still running` }); return null; }
+    if (s.archiveState === 'unsaved' || s.archiveState === 'saving') await this.saveArchive();   // commit what is on screen, not what was on disk 400ms ago
+    const name = args[0] || '';
+    this.setState({ git: { busy: name }, msg: `git ${name}…` });
+    let r;
+    try { const res = await fetch('/api/git', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ args }) }); r = await res.json(); if (!res.ok) throw new Error(r.error || res.statusText); }
+    catch (e) { r = { code: 1, out: '', err: String(e.message || e) }; }
+    const run = { args, out: r.out || '', err: r.err || '', code: r.code };
+    const ok = run.code === 0, msg = ok && opts.quiet ? this.state.msg : `git ${name} · ${ok ? 'ok' : 'failed'} · ${gitSummary(run)}`;
+    this.setState({ git: { busy: null }, msg: msg.length > 160 ? msg.slice(0, 157) + '…' : msg });
+    if (ok && /^(pull|checkout|switch|merge|reset|rebase|stash|revert|restore|cherry-pick)$/.test(name)) this.loadArchive(false);
+    return run;
+  }
+  async gitCommit(message) {
+    const msg = message || 'notes · ' + new Date().toISOString().slice(0, 16).replace('T', ' ');
+    if (!(await this.runGit(['add', '-A'], { quiet: true }))) return;
+    const st = await this.runGit(['status', '--porcelain'], { quiet: true }); if (!st || st.code !== 0) return;
+    if (!st.out.trim()) return this.setState({ msg: 'git · nothing to commit · working tree clean' });
+    const c = await this.runGit(['commit', '-m', msg], { quiet: true }); if (!c || c.code !== 0) return;
+    const p = await this.runGit(['push'], { quiet: true }); if (p && p.code === 0) this.setState({ msg: `git · committed and pushed · "${msg}"` });
+  }
   openTag(name) {
     const s = this.state, k = norm(name); if (!k) return;
     const from = s.view.type === 'tag' ? s.view.from : { view: s.view, cur: s.cur };
@@ -221,12 +264,41 @@ export default class Notes extends React.Component {
     const o = it.kind === 'book' ? it.b : it.kind === 'quote' ? it.q : it.kind === 'vocab' ? it.w : it.t, text = this.bufText(it.kind, o);
     this.openBuf({ kind: it.kind, isNew: false, id: o.id, bookId: it.b ? it.b.id : this.state.view.bookId, quoteId: it.kind === 'thought' ? it.q.id : undefined }, text, where === 'normal' ? 'normal' : 'insert', where === 'end' ? text.length : 0);
   }
+  // ---- new book: two inline fields, title then author, Enter after each (the one thing not typed in the buffer: it is a form, not a text).
+  // "Title - Author" in the first field fills both; an empty author skips it; Esc cancels.
+  startBook() { this.setState({ mode: 'fields', fields: { step: 'title', title: '', text: '', pos: 0 }, focus: 'main', vanchor: null, msg: '', help: false }); }
+  fieldsSet(text, pos) { this.setState({ fields: { ...this.state.fields, text, pos } }); }
+  fieldsDone() {
+    const s = this.state, f = s.fields; if (!f) return;
+    const text = f.text.trim();
+    if (f.step === 'title') {
+      if (!text) return this.setState({ mode: 'normal', fields: null, msg: '' });
+      const [title, author] = splitTitle(text);
+      if (author) return this.addBook(title, author);
+      return this.setState({ fields: { step: 'author', title, text: '', pos: 0 }, msg: '' });
+    }
+    this.addBook(f.title, text);
+  }
+  addBook(title, author) { const n = this.state.books.length; this.writeBuf({ kind: 'book', isNew: true }, author ? title + '\n' + author : title); this.setState({ mode: 'normal', fields: null, cur: n, msg: `"${title}"${author ? ' — ' + author : ''} created` }); }
+  fieldsKey(k) {
+    const f = this.state.fields, t = f.text, p = Math.min(f.pos, t.length);
+    if (k === 'Escape') return this.setState({ mode: 'normal', fields: null, msg: '' });
+    if (k === 'Enter') return this.fieldsDone();
+    if (k === 'Backspace') { if (!p) return; return this.fieldsSet(t.slice(0, p - 1) + t.slice(p), p - 1); }
+    if (k === 'Delete') return this.fieldsSet(t.slice(0, p) + t.slice(p + 1), p);
+    if (k === 'ArrowLeft') return this.fieldsSet(t, Math.max(0, p - 1));
+    if (k === 'ArrowRight') return this.fieldsSet(t, Math.min(t.length, p + 1));
+    if (k === 'Home') return this.fieldsSet(t, 0);
+    if (k === 'End') return this.fieldsSet(t, t.length);
+    if (k.length === 1) return this.fieldsSet(t.slice(0, p) + k + t.slice(p), p + 1);
+  }
+  fieldsShortcut(e) { const f = this.state.fields, r = this.lineShortcut(e, f.text, Math.min(f.pos, f.text.length)); if (!r) return false; e.preventDefault(); this.fieldsSet(r.text, r.pos); return true; }
   startNew(kind, text = '', vmode = 'insert', extra = {}) { const v = this.state.view; this.openBuf({ kind, isNew: true, bookId: v.bookId, quoteId: v.quoteId, ...extra }, text, vmode, text.length); }
   // thread: `o` adds a sibling after the thought under the cursor, `a` a reply beneath it
   newThought(reply) { const it = this.items()[this.state.cur]; this.startNew('thought', '', 'insert', it ? (reply ? { parentId: it.t.id } : { afterId: it.t.id }) : {}); }
   newHere() {
     const v = this.state.view;
-    if (v.type === 'library') this.startNew('book');
+    if (v.type === 'library') this.startBook();
     else if (v.type === 'book') this.startNew(v.sec === 'vocab' ? 'vocab' : 'quote');
     else if (v.type === 'thread') this.newThought(false);
     else if (v.type === 'tag') this.setState({ msg: 'open an item to add to it' });
@@ -451,7 +523,7 @@ export default class Notes extends React.Component {
         case 'V': return this.setC(c, L.vmode === 'vline' ? { vmode: 'normal', vanchor: null } : { vmode: 'vline' });
         case 'o': return this.setC(L.vanchor, { vanchor: c });
         case 'g': case 'i': case 'a': return this.setState({ long: { ...L, pending: k } });
-        case ':': return this.setState({ mode: 'command', cmd: '', msg: '', help: false });
+        case ':': return this.setState({ mode: 'command', cmd: '', cmdc: 0, histIdx: null, msg: '', help: false });
         default: { const m = motion(k); if (m && m.to != null) return go(m); return; }
       }
     }
@@ -476,7 +548,7 @@ export default class Notes extends React.Component {
       case 'p': return paste(true);
       case 'P': return paste(false);
       case 'u': return this.longUndo();
-      case ':': return this.setState({ mode: 'command', cmd: '', msg: '', help: false });
+      case ':': return this.setState({ mode: 'command', cmd: '', cmdc: 0, histIdx: null, msg: '', help: false });
       case '?': return this.setState({ help: !s.help });
       default: { const m = motion(k); if (m && m.to != null) return go(m); }
     }
@@ -522,6 +594,7 @@ export default class Notes extends React.Component {
   settle() {
     const s = this.state;
     if (s.long) return this.commitLong();
+    if (s.mode === 'fields') return this.fieldsDone();
     if (s.mode === 'command' || s.mode === 'search') return this.setState({ mode: 'normal', cmd: '', filter: s.mode === 'command' ? s.filter : s.search });
     if (s.mode === 'visual') return this.setState({ mode: 'normal', vanchor: null });
   }
@@ -539,7 +612,7 @@ export default class Notes extends React.Component {
       if (!['theme', 'colorscheme', 'set', 'help', 'h'].includes(head)) return set({ msg: 'while editing: :w :wq :q :q!' });
     }
     if (head === 'q' || head === 'quit') { set({}); return this.back(); }
-    if (head === 'new') { const [what, ...t] = rest; const title = t.join(' '); if (what === 'book') { if (!title) { set({}); return this.startNew('book'); } this.writeBuf({ kind: 'book', isNew: true }, title); return set({ cur: s.books.length, msg: `"${title}" created` }); } if (what === 'thought' && v.type === 'thread') { set({}); return this.startNew('thought'); } return set({ msg: 'usage: :new book <title>' }); }
+    if (head === 'new') { const [what, ...t] = rest; const title = t.join(' '); if (what === 'book') { if (!title) { set({}); return this.startBook(); } this.writeBuf({ kind: 'book', isNew: true }, title); return set({ cur: s.books.length, msg: `"${title}" created` }); } if (what === 'thought' && v.type === 'thread') { set({}); return this.startNew('thought'); } return set({ msg: 'usage: :new book <title>' }); }
     if (head === 'quote') { if (v.type !== 'book') return set({ msg: 'open a book first' }); const sw = { view: { type: 'book', bookId: v.bookId, sec: 'quotes' }, ...this.sidePos(v.bookId, 'quotes') }; if (!arg) { set(sw); return this.startNew('quote'); } this.writeBuf({ kind: 'quote', isNew: true, bookId: v.bookId }, arg); return set({ ...sw, cur: this.book().quotes.length, msg: 'quote added · :page <n> to set page' }); }
     if (head === 'def') { if (v.type !== 'book') return set({ msg: 'open a book first' }); set({ view: { type: 'book', bookId: v.bookId, sec: 'vocab' }, ...this.sidePos(v.bookId, 'vocab') }); return this.startNew('vocab', arg ? arg + '\n' : '', 'insert'); }
     if (head === 'page') { const n = parseInt(arg, 10); const it = this.items()[s.cur]; if (v.type === 'thread' || (it && it.kind === 'quote')) { this.mutate(bs => { const q = bs.find(b => b.id === v.bookId).quotes.find(q => q.id === (v.quoteId || it.q.id)); q.page = isNaN(n) ? null : n; }); return set({ msg: isNaN(n) ? 'page cleared' : `p. ${n}` }); } return set({ msg: 'no quote under cursor' }); }
@@ -554,6 +627,9 @@ export default class Notes extends React.Component {
     if (head === 'reset') { this.undo.push(JSON.stringify(s.books)); return set({ books: seed(), view: { type: 'library' }, cur: 0, side: 0, expanded: {}, msg: 'everything cleared · u to undo' }); }
     if (head === 'e' || head === 'files') return set({ sidebar: true, focus: 'side' });
     if (head === 'vocab' || head === 'words') { set({}); return this.goView({ type: 'vocab' }); }
+    if (head === 'git') { set({}); const args = commitMsg(splitArgs(arg), arg); if (!args.length) return this.setState({ msg: ':git <args> · e.g. :git status' }); return this.runGit(args); }
+    if (head === 'commit') { set({}); return this.gitCommit(arg); }
+    if (head === 'push' || head === 'pull' || head === 'status' || head === 'log') { set({}); return this.runGit(head === 'log' ? ['log', '--oneline', '-n', '20', ...splitArgs(arg)] : head === 'status' ? ['status', '--short', '--branch', ...splitArgs(arg)] : [head, ...splitArgs(arg)]); }
     if (head === 'ai' || head === 'lookup') { if (v.type === 'word') { set({}); return this.loadAI(true); } const it = this.items()[s.cur]; if (it && it.kind === 'vocab') { set({}); return this.openWord(it.b.id, it.w.id); } return set({ msg: 'put the cursor on a word first' }); }
     set({ msg: `not a command: ${head}` });
   }
@@ -586,8 +662,9 @@ export default class Notes extends React.Component {
   // in the lists, a paste becomes a new item opened in the buffer (normal mode) so it can be checked before :wq
   pasteText(raw) {
     const s = this.state, flat = raw.replace(/\r?\n+/g, ' '), text = raw.replace(/\r\n/g, '\n').trim();
-    if (s.mode === 'command') return this.setState({ cmd: s.cmd + flat });
+    if (s.mode === 'command') { const c = Math.min(s.cmdc, s.cmd.length); return this.setState({ cmd: s.cmd.slice(0, c) + flat + s.cmd.slice(c), cmdc: c + flat.length }); }
     if (s.mode === 'search') { const cmd = s.cmd + flat; return this.setState({ cmd, filter: cmd, cur: 0 }); }
+    if (s.mode === 'fields') { const f = s.fields, p = Math.min(f.pos, f.text.length); return this.fieldsSet(f.text.slice(0, p) + flat + f.text.slice(p), p + flat.length); }
     if (!text || s.focus === 'side') return;
     const v = s.view, kind = v.type === 'library' ? 'book' : v.type === 'book' ? (v.sec === 'vocab' ? 'vocab' : 'quote') : v.type === 'thread' ? 'thought' : null;
     if (kind) this.startNew(kind, kind === 'book' ? flat.trim() : text, 'normal');
@@ -624,12 +701,13 @@ export default class Notes extends React.Component {
   key(e) {
     const s = this.state, L = s.long, editing = L && s.mode !== 'command';   // keys go to the buffer
     if (e.metaKey && e.code === 'Space') { e.preventDefault(); this.pending(' '); return; }
-    if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'h' || e.key === 'l') && !L && s.mode !== 'command' && s.mode !== 'search') { e.preventDefault(); return this.focusPane(e.key === 'h' ? 'side' : 'main'); }
+    if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'h' || e.key === 'l') && !L && s.mode !== 'command' && s.mode !== 'search' && s.mode !== 'fields') { e.preventDefault(); return this.focusPane(e.key === 'h' ? 'side' : 'main'); }
     const tq = this.tagQuery(), opts = tq !== null ? this.tagOptions(tq.q) : [];
     if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'n' || e.key === 'p') && opts.length) { e.preventDefault(); return this.setState({ long: { ...L, tagSel: (L.tagSel + (e.key === 'n' ? 1 : opts.length - 1)) % opts.length } }); }
     if (editing && e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'r' && L.vmode !== 'insert') { e.preventDefault(); return this.longRedo(); }
     if ((e.metaKey || e.ctrlKey || e.altKey) && !(e.metaKey && e.ctrlKey)) {
       if ((s.mode === 'command' || s.mode === 'search') && this.cmdShortcut(e)) return;
+      if (s.mode === 'fields' && this.fieldsShortcut(e)) return;
       if (editing && L.vmode === 'insert' && this.longChop(e)) return;
     }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -638,13 +716,21 @@ export default class Notes extends React.Component {
     if (k === 'Shift' || k === 'CapsLock') return;
     if (k === 'Tab' && s.mode !== 'command') return;
     e.preventDefault();
+    if (s.mode === 'fields') return this.fieldsKey(k);
     if (s.mode === 'command' || s.mode === 'search') {
-      const isCmd = s.mode === 'command';
+      const isCmd = s.mode === 'command', c = Math.min(s.cmdc, s.cmd.length);
+      const put = (cmd, cmdc) => this.setState({ cmd, cmdc, filter: isCmd ? s.filter : cmd, cur: isCmd ? s.cur : 0 });
       if (k === 'Escape') return this.setState({ mode: 'normal', cmd: '', filter: isCmd ? s.filter : s.search });
-      if (k === 'Enter') { if (isCmd) return this.runCmd(s.cmd); return this.setState({ mode: 'normal', search: s.filter, cmd: '', msg: this.items().length + ' match' + (this.items().length === 1 ? '' : 'es') + (s.filter ? ' · Esc clears' : '') }); }
-      if (k === 'Backspace') { if (!s.cmd) return this.setState({ mode: 'normal', filter: isCmd ? s.filter : s.search }); const cmd = s.cmd.slice(0, -1); return this.setState({ cmd, filter: isCmd ? s.filter : cmd, cur: isCmd ? s.cur : 0 }); }
-      if (k === 'Tab' && isCmd) { const m = CMDS.find(c => c[0].startsWith(s.cmd)); if (m) this.setState({ cmd: m[0].replace(/<.*>/, '').trimEnd() + (m[0].includes('<') ? ' ' : '') }); return; }
-      if (k.length === 1) { const cmd = s.cmd + k; return this.setState({ cmd, filter: isCmd ? s.filter : cmd, cur: isCmd ? s.cur : 0 }); }
+      if (k === 'Enter') { if (isCmd) { this.remember(s.cmd); return this.runCmd(s.cmd); } return this.setState({ mode: 'normal', search: s.filter, cmd: '', msg: this.items().length + ' match' + (this.items().length === 1 ? '' : 'es') + (s.filter ? ' · Esc clears' : '') }); }
+      if (k === 'Backspace') { if (!s.cmd) return this.setState({ mode: 'normal', filter: isCmd ? s.filter : s.search }); if (!c) return; return put(s.cmd.slice(0, c - 1) + s.cmd.slice(c), c - 1); }
+      if (k === 'Delete') return put(s.cmd.slice(0, c) + s.cmd.slice(c + 1), c);
+      if (k === 'ArrowLeft') return this.setState({ cmdc: Math.max(0, c - 1) });
+      if (k === 'ArrowRight') return this.setState({ cmdc: Math.min(s.cmd.length, c + 1) });
+      if (k === 'Home') return this.setState({ cmdc: 0 });
+      if (k === 'End') return this.setState({ cmdc: s.cmd.length });
+      if (isCmd && (k === 'ArrowUp' || k === 'ArrowDown')) return this.histMove(k === 'ArrowUp' ? -1 : 1);
+      if (k === 'Tab' && isCmd) { const m = CMDS.find(x => x[0].startsWith(s.cmd)); if (m) { const cmd = m[0].replace(/<.*>/, '').trimEnd() + (m[0].includes('<') ? ' ' : ''); put(cmd, cmd.length); } return; }
+      if (k.length === 1) return put(s.cmd.slice(0, c) + k + s.cmd.slice(c), c + 1);
       return;
     }
     // normal / visual
@@ -652,13 +738,33 @@ export default class Notes extends React.Component {
     if (/^[1-9]$/.test(k) || (k === '0' && s.count)) return this.setState({ count: s.count + k });
     this.pending(k);
   }
+  // command-line history: Up / Down walk it, the line being typed is kept as a draft at the bottom
+  remember(cmd) { const c = cmd.trim(); if (!c) return; if (this.hist[this.hist.length - 1] !== c) this.hist = [...this.hist, c].slice(-100); try { localStorage.setItem('notes.hist.v1', JSON.stringify(this.hist)); } catch (e) {} }
+  histMove(d) {
+    const s = this.state, h = this.hist, at = s.histIdx === null ? h.length : s.histIdx, to = Math.max(0, Math.min(h.length, at + d));
+    if (to === at) return;
+    const cmd = to === h.length ? s.histDraft : h[to];
+    this.setState({ cmd, cmdc: cmd.length, histIdx: to === h.length ? null : to, histDraft: at === h.length ? s.cmd : s.histDraft });
+  }
+  // word / line shortcuts for a one-line field, relative to the cursor: ⌥← ⌥→ ⌘← ⌘→ Ctrl-a Ctrl-e move · ⌥⌫ Ctrl-w ⌘⌫ Ctrl-u Ctrl-k delete.
+  // Returns the new { text, pos }, or null if the key is not one of these.
+  lineShortcut(e, t, c) {
+    const k = e.key, alt = e.altKey && !e.metaKey && !e.ctrlKey, meta = e.metaKey && !e.altKey, ctrl = e.ctrlKey && !e.metaKey && !e.altKey;
+    const wordBack = () => { let a = c; while (a > 0 && /\s/.test(t[a - 1])) a--; while (a > 0 && !/\s/.test(t[a - 1])) a--; return a; }, wordFwd = () => { let b = c; while (b < t.length && /\s/.test(t[b])) b++; while (b < t.length && !/\s/.test(t[b])) b++; return b; };
+    let text = t, pos = c;
+    if (alt && k === 'ArrowLeft') pos = wordBack();
+    else if (alt && k === 'ArrowRight') pos = wordFwd();
+    else if ((meta && k === 'ArrowLeft') || (ctrl && k === 'a')) pos = 0;
+    else if ((meta && k === 'ArrowRight') || (ctrl && k === 'e')) pos = t.length;
+    else if ((alt && k === 'Backspace') || (ctrl && k === 'w')) { const a = wordBack(); text = t.slice(0, a) + t.slice(c); pos = a; }
+    else if ((meta && k === 'Backspace') || (ctrl && k === 'u')) { text = t.slice(c); pos = 0; }
+    else if (ctrl && k === 'k') text = t.slice(0, c);
+    else return null;
+    return { text, pos };
+  }
   cmdShortcut(e) {
-    const s = this.state, k = e.key, isCmd = s.mode === 'command', alt = e.altKey && !e.metaKey && !e.ctrlKey, meta = e.metaKey && !e.altKey, ctrl = e.ctrlKey && !e.metaKey && !e.altKey;
-    let cmd;
-    if ((alt && k === 'Backspace') || (ctrl && k === 'w')) cmd = s.cmd.replace(/\s*\S+\s*$/, '');
-    else if ((meta && k === 'Backspace') || (ctrl && k === 'u')) cmd = '';
-    else return false;
-    e.preventDefault(); this.setState({ cmd, filter: isCmd ? s.filter : cmd, cur: isCmd ? s.cur : 0 }); return true;
+    const s = this.state, isCmd = s.mode === 'command', r = this.lineShortcut(e, s.cmd, Math.min(s.cmdc, s.cmd.length)); if (!r) return false;
+    e.preventDefault(); this.setState({ cmd: r.text, cmdc: r.pos, filter: isCmd ? s.filter : r.text, cur: isCmd ? s.cur : 0 }); return true;
   }
   // vim's Ctrl-w / Ctrl-u inside the long-form textarea (mac option/cmd shortcuts are native there)
   longChop(e) {
@@ -707,8 +813,8 @@ export default class Notes extends React.Component {
       case 'p': case 'P': { if (side) return; if (!navigator.clipboard || !navigator.clipboard.readText) return this.setState({ msg: 'clipboard unavailable · use ⌘v' }); navigator.clipboard.readText().then(t => this.pasteText(t)).catch(() => this.setState({ msg: 'clipboard unavailable · use ⌘v' })); return; }
       case 'r': if (s.view.type === 'word') return this.loadAI(true); return;
       case 'u': return this.undoOnce();
-      case ':': return this.setState({ mode: 'command', cmd: '', msg: '', help: false });
-      case '/': return this.setState({ mode: 'search', cmd: '', filter: '', msg: '', cur: 0 });
+      case ':': return this.setState({ mode: 'command', cmd: '', cmdc: 0, histIdx: null, msg: '', help: false });
+      case '/': return this.setState({ mode: 'search', cmd: '', cmdc: 0, filter: '', msg: '', cur: 0 });
       case '?': return this.setState({ help: !s.help });
       case 'n': return this.setState({ msg: s.search ? `filtered by /${s.search}` : 'no previous search' });
       case 'q': return this.back();
@@ -716,7 +822,7 @@ export default class Notes extends React.Component {
   }
   itemsFor(books) { const b = this.state.books; this.state.books = books; const r = this.items(); this.state.books = b; return r; }
   // ---- mouse
-  clickRow(i) {
+  clickRow(i) { if (this.state.mode === 'fields') this.fieldsDone();
     const s = this.state; if (i === undefined) return;
     this.setState({ cur: i, focus: 'main', mode: s.mode === 'visual' ? 'visual' : 'normal', hover: null, msg: s.mode === 'visual' ? s.msg : '' });
   }
@@ -734,14 +840,14 @@ export default class Notes extends React.Component {
       case 'edit': this.settle(); return s.focus === 'side' ? this.setState({ msg: 'select a line in the main pane' }) : this.startEdit('normal');
       case 'delete': this.settle(); return s.focus === 'side' ? this.setState({ msg: 'delete from the library, not the tree' }) : this.deleteRange(s.mode === 'visual' ? s.vanchor : s.cur, s.cur);
       case 'undo': this.settle(); return this.undoOnce();
-      case 'cmd': this.settle(); return this.setState({ mode: 'command', cmd: '', msg: '', help: false });
+      case 'cmd': this.settle(); return this.setState({ mode: 'command', cmd: '', cmdc: 0, histIdx: null, msg: '', help: false });
       case 'help': return this.setState({ help: !s.help });
       case 'theme': return this.setState({ theme: s.theme === 'light' ? 'dark' : 'light' });
       case 'sidebar': return this.setState({ sidebar: !s.sidebar, focus: s.sidebar && s.focus === 'side' ? 'main' : s.focus });
       case 'done': return this.settle();
       case 'run': return this.runCmd(s.cmd);
       case 'apply': return this.setState({ mode: 'normal', search: s.filter, cmd: '' });
-      case 'cancel': return this.setState({ mode: 'normal', cmd: '', filter: s.mode === 'search' ? s.search : s.filter, vanchor: null });
+      case 'cancel': return this.setState({ mode: 'normal', cmd: '', fields: null, filter: s.mode === 'search' ? s.search : s.filter, vanchor: null });
       case 'clear': return this.setState({ filter: '', search: '', msg: '' });
       case 'yank': { const a = Math.min(s.vanchor, s.cur), b = Math.max(s.vanchor, s.cur); try { navigator.clipboard.writeText(this.yankRange(a, b)); } catch (e) {} return this.setState({ mode: 'normal', vanchor: null, msg: `${b - a + 1} lines yanked` }); }
       case 'keep': return this.commitLong();
@@ -749,7 +855,7 @@ export default class Notes extends React.Component {
       case 'close': return this.runCmd('q');
     }
   }
-  clickComp(cp) { if (cp.arg) return this.setState({ cmd: cp.prefix }); this.runCmd(cp.prefix); }
+  clickComp(cp) { if (cp.arg) return this.setState({ cmd: cp.prefix, cmdc: cp.prefix.length }); this.runCmd(cp.prefix); }
   // ---- rich text: [tag] links
   rich(text) {
     const str = String(text ?? ''), parts = []; let last = 0, m; const re = new RegExp(LINK_RE.source, 'g');
@@ -809,7 +915,8 @@ export default class Notes extends React.Component {
     else if (v.type === 'library') {
       lines.push(header('', 'TITLE', 'QUOTES', 'VOCAB', 'TAGS', 'TOUCHED'));
       items.forEach((it, i) => { const bk = it.b, t = touched(bk); lines.push(row(i, { id: bk.id, main: bk.title, sub: bk.author ? '— ' + bk.author : '', a: String(bk.quotes.length), b: String(bk.vocab.length), c: bk.tags.join(' '), d: t ? fmtDay(t) : '—' })); });
-      if (!items.length) lines.push(note(s.filter ? 'no books match' : 'no books yet — o or :new book <title>'));
+      if (s.mode === 'fields') { const f = s.fields, onTitle = f.step === 'title'; lines.push({ isRow: true, isHeader: false, num: '', numColor: 'var(--faint)', bg: 'var(--hl,#f3f1ec)', weight: 400, mainColor: 'var(--ink,#111)', pre: '', main: '', sub: '', a: '', b: '', c: '', d: '', pos: Math.min(f.pos, f.text.length), fields: [{ text: onTitle ? f.text : f.title, ph: 'title', active: onTitle }, { text: onTitle ? '' : f.text, ph: 'author', active: !onTitle }] }); }
+      else if (!items.length) lines.push(note(s.filter ? 'no books match' : 'no books yet — o or :new book <title>'));
       const nq = s.books.reduce((n, x) => n + x.quotes.length, 0), nv = s.books.reduce((n, x) => n + x.vocab.length, 0);
       summary = `${s.books.length} books · ${nq} quotes · ${nv} words`;
     } else if (v.type === 'book' && b) {
@@ -871,15 +978,16 @@ export default class Notes extends React.Component {
     const L = s.long, lb = L && s.books.find(x => x.id === L.bookId), lq = lb && L.quoteId && lb.quotes.find(x => x.id === L.quoteId);
     const bufTitle = L ? `${L.isNew ? 'new ' : ''}${L.kind === 'vocab' ? 'word' : L.kind}${lb ? ' · ' + lb.slug + (lq ? '/' + qn(lb, lq) : '') : ''}` : '';
     const bufHint = L ? (L.kind === 'book' ? 'line 1 title · line 2 author' : L.kind === 'vocab' ? 'line 1 word · definition below' : '[word] links a tag') : '';
-    const modeLabel = s.mode === 'command' ? 'COMMAND' : L ? VMODES[L.vmode] : s.mode === 'search' ? 'SEARCH' : s.mode.toUpperCase();
-    const cmdText = s.mode === 'command' ? ':' + s.cmd : s.mode === 'search' ? '/' + s.cmd : L ? (L.vmode === 'insert' ? '-- INSERT --  Esc → normal · [ links a tag' : L.vmode === 'visual' ? '-- VISUAL --  d delete · y yank · c change · t tag · Esc' : L.vmode === 'vline' ? '-- VISUAL LINE --  d delete · y yank · c change · t tag · Esc' : s.msg || (s.longText !== L.saved ? '[+] modified · :w writes · :wq writes and closes · :q! discards' : ':q closes · i insert · v visual')) : s.mode === 'visual' ? '-- VISUAL LINE --  d delete · y yank · Esc' : s.msg || (s.search ? `/${s.search}  (Esc clears)` : '');
+    const modeLabel = s.mode === 'fields' ? 'INSERT' : s.mode === 'command' ? 'COMMAND' : L ? VMODES[L.vmode] : s.mode === 'search' ? 'SEARCH' : s.mode.toUpperCase();
+    const cmdText = s.mode === 'fields' ? (s.fields.step === 'title' ? '-- INSERT --  title · Enter  (or "Title - Author")  · Esc cancels' : '-- INSERT --  author · Enter  (empty skips)  · Esc cancels') : s.mode === 'command' ? ':' + s.cmd : s.mode === 'search' ? '/' + s.cmd : L ? (L.vmode === 'insert' ? '-- INSERT --  Esc → normal · [ links a tag' : L.vmode === 'visual' ? '-- VISUAL --  d delete · y yank · c change · t tag · Esc' : L.vmode === 'vline' ? '-- VISUAL LINE --  d delete · y yank · c change · t tag · Esc' : s.msg || (s.longText !== L.saved ? '[+] modified · :w writes · :wq writes and closes · :q! discards' : ':q closes · i insert · v visual')) : s.mode === 'visual' ? '-- VISUAL LINE --  d delete · y yank · Esc' : s.msg || (s.search ? `/${s.search}  (Esc clears)` : '');
+    const cmdCursorAt = s.mode === 'command' || s.mode === 'search' ? 1 + Math.min(s.cmdc, s.cmd.length) : null;   // +1 for the : or / prefix
     const comps = s.mode === 'command' ? CMDS.filter(c => c[0].startsWith(s.cmd) && s.cmd.length > 0 || (!s.cmd && ['q', 'new book <title>', 'quote', 'def <word>', 'help'].includes(c[0]))).slice(0, 6).map((c, i) => ({ label: ':' + c[0], hint: c[1], bg: i === 0 && s.cmd ? 'var(--hl,#f3f1ec)' : 'transparent', prefix: c[0].replace(/<.*>/, '').trimEnd() + (c[0].includes('<') ? ' ' : ''), arg: c[0].includes('<') })) : [];
     const tq = this.tagQuery(), tagOpts = tq !== null ? this.tagOptions(tq.q).map((o, i) => ({ ...o, label: (tq.close === ')' ? '(' : '[') + o.name + tq.close, hint: o.create ? 'new tag' : `${idx.get(o.name).refs.length} ${idx.get(o.name).refs.length === 1 ? 'place' : 'places'}`, bg: i === (L ? L.tagSel : 0) % Math.max(1, this.tagOptions(tq.q).length) ? 'var(--hl,#f3f1ec)' : 'transparent' })) : [];
     const hoverEntry = s.hover ? idx.get(s.hover.tag) : null;
     const hover = s.hover ? { ...s.hover, name: s.hover.tag, refs: hoverEntry ? hoverEntry.refs.slice(0, 8) : [], total: hoverEntry ? hoverEntry.refs.length : 0 } : null;
     const cursorIdx = s.focus === 'side' ? s.side : s.cur, navN = s.focus === 'side' ? this.sideList().length : items.length;
     const actions = [['new', 'new'], ['edit', 'edit'], ['del', 'delete'], ['undo', 'undo'], [':cmd', 'cmd'], ['?', 'help'], [s.theme === 'light' ? 'dark' : 'light', 'theme'], ['sidebar', 'sidebar']].map(([label, name]) => ({ label, name }));
-    const cmdBtns = s.long && s.mode !== 'command' ? [['write', 'write'], ['write & close', 'keep'], ['close', 'close']] : s.mode === 'command' ? [['run', 'run'], ['cancel', 'cancel']] : s.mode === 'search' ? [['apply', 'apply'], ['cancel', 'cancel']] : s.mode === 'visual' ? [['delete', 'delete'], ['yank', 'yank'], ['cancel', 'cancel']] : s.search ? [['clear search', 'clear']] : [];
+    const cmdBtns = s.mode === 'fields' ? [['next', 'done'], ['cancel', 'cancel']] : s.long && s.mode !== 'command' ? [['write', 'write'], ['write & close', 'keep'], ['close', 'close']] : s.mode === 'command' ? [['run', 'run'], ['cancel', 'cancel']] : s.mode === 'search' ? [['apply', 'apply'], ['cancel', 'cancel']] : s.mode === 'visual' ? [['delete', 'delete'], ['yank', 'yank'], ['cancel', 'cancel']] : s.search ? [['clear search', 'clear']] : [];
     return {
       th, sidebarOpen: s.sidebar, sideItems, tags, crumbs, summary, statusPath, isEmpty: v.type === 'empty', isThread: v.type === 'thread' && !!quote, quote: quote || {}, isWord: !!word, word: word || {}, showLines: !s.long && v.type !== 'empty' && v.type !== 'word', lines,
       longform: !!L, bufTitle, bufHint, vclass: L ? (L.vmode === 'insert' ? 'vinsert' : L.vmode === 'normal' ? 'vnormal' : 'vvisual') : '', longRef: this.longRef, mirrorRef: this.mirrorRef, longText: s.longText,
@@ -891,7 +999,7 @@ export default class Notes extends React.Component {
       showComp: comps.length > 0, comps, showTagPop: tagOpts.length > 0, tagOpts, showHelp: s.help, helpRows: HELP.map(([k, v]) => ({ k, v })), hover,
       store: s.archive ? (s.archiveState === 'saved' ? 'archive' : s.archiveState === 'error' ? 'archive!' : 'archive…') : 'local', storeTitle: s.archive || 'localStorage only (no dev server)',
       modeLabel, showcmd: (s.count + s.pending).replace(' ', '␣'), pos: `${Math.min(cursorIdx + 1, Math.max(navN, 1))},1  ${navN ? 'All' : '—'}`,
-      cmdText, cmdColor: s.mode === 'command' || s.mode === 'search' ? 'var(--ink,#111)' : 'var(--muted,#8a877f)', cmdCursor: s.mode === 'command' || s.mode === 'search', cmdBtns, actions,
+      cmdText, cmdPre: cmdCursorAt === null ? cmdText : cmdText.slice(0, cmdCursorAt), cmdAt: cmdCursorAt === null ? '' : cmdText[cmdCursorAt] || ' ', cmdPost: cmdCursorAt === null ? '' : cmdText.slice(cmdCursorAt + 1), cmdColor: s.mode === 'command' || s.mode === 'search' ? 'var(--ink,#111)' : 'var(--muted,#8a877f)', cmdCursor: cmdCursorAt !== null, cmdBtns, actions,
       focusRoot: e => { const t = e.target.tagName; if (t !== 'TEXTAREA' && t !== 'INPUT') e.currentTarget.focus(); },
     };
   }
@@ -965,7 +1073,9 @@ export default class Notes extends React.Component {
                     <span className="row-num" style={{ color: ln.numColor }}>{ln.num}</span>
                     <span className="row-pre">{ln.pre}</span>
                     <span className="row-main" style={{ color: ln.mainColor, paddingLeft: ln.indent ? ln.indent * 22 : 0 }}>
-                      {ln.indent ? <span className="row-sub">↳ </span> : null}{this.rich(ln.main)}
+                      {ln.fields ? ln.fields.map((f, j) => (
+                        <React.Fragment key={j}>{j > 0 && <span className="row-sub"> — </span>}{f.active ? <>{f.text.slice(0, ln.pos)}<span className="caret">{f.text[ln.pos] || ' '}</span>{f.text.slice(ln.pos + 1)}{!f.text && <span className="ph">{f.ph}</span>}</> : f.text || <span className="ph">{f.ph}</span>}</React.Fragment>
+                      )) : <>{ln.indent ? <span className="row-sub">↳ </span> : null}{this.rich(ln.main)}</>}
                       <span className="row-sub"> {ln.sub}</span>
                     </span>
                     <span className="row-a">{ln.a}</span>
@@ -1025,7 +1135,7 @@ export default class Notes extends React.Component {
             </span>
           </div>
           <div className="cmdline" style={{ color: V.cmdColor }} onClick={() => { if (this.state.mode === 'normal' && !this.state.long) this.action('cmd'); }}>
-            <span>{V.cmdText}{V.cmdCursor && <span className="caret"> </span>}</span>
+            <span>{V.cmdPre}{V.cmdCursor && <span className="caret">{V.cmdAt}</span>}{V.cmdPost}</span>
             <span className="cmd-btns">{V.cmdBtns.map(([label, name]) => <span key={name} className="cmd-btn" onClick={stop(() => this.action(name))}>{label}</span>)}</span>
           </div>
         </div>

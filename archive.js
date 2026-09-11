@@ -7,6 +7,7 @@
 // Used by vite.config.js (dev server API). The app is the only editor: it loads this at startup and writes on every change.
 import { promises as fs, existsSync } from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 
 const plain = s => /^[A-Za-z0-9][A-Za-z0-9 _.\-'’!?()&,]*$/.test(s) && !/\s$/.test(s) && !/^(true|false|null|\d+)$/.test(s);
 const enc = v => Array.isArray(v) ? '[' + v.map(enc).join(', ') + ']' : typeof v === 'number' ? String(v) : plain(String(v)) ? String(v) : JSON.stringify(String(v));
@@ -100,14 +101,35 @@ export async function writeArchive(root, books) {
   return { written, deleted, files: files.size };
 }
 
-// ---- vite plugin: GET /api/archive reads the folder, PUT writes it
+// ---- git: POST /api/git { args: [...] } runs `git <args>` inside the archive folder, as the user who started the dev server.
+// git inherits the shell's environment (ssh keys, host aliases, config), so no login is needed. It must never prompt:
+// there is nobody to answer, so terminal prompts and askpass are disabled and the run is cut off after a timeout.
+const runGit = (root, args, timeout = 30000) => new Promise(resolve => {
+  const p = spawn('git', ['-c', 'core.askPass=', '-c', 'core.editor=false', ...args], { cwd: root, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '', SSH_ASKPASS: '', GIT_PAGER: 'cat', PAGER: 'cat', TERM: 'dumb' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', err = '', done = false;
+  const finish = (code, extra) => { if (done) return; done = true; clearTimeout(timer); resolve({ code, out, err: err + (extra || '') }); };
+  const timer = setTimeout(() => { p.kill('SIGKILL'); finish(124, `\n[timed out after ${timeout / 1000}s]`); }, timeout);
+  p.stdout.on('data', c => { out += c; });
+  p.stderr.on('data', c => { err += c; });
+  p.on('error', e => finish(127, e.message));
+  p.on('close', code => finish(code == null ? 1 : code));
+});
+
+// ---- vite plugin: GET /api/archive reads the folder, PUT writes it · POST /api/git runs git there
 export function archivePlugin(dir) {
   const root = path.resolve(dir || 'archive');
   const api = server => {
     server.middlewares.use(async (req, res, next) => {
-      if (!req.url.startsWith('/api/archive')) return next();
+      if (!req.url.startsWith('/api/archive') && !req.url.startsWith('/api/git')) return next();
       const json = (code, obj) => { res.statusCode = code; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(obj)); };
       try {
+        if (req.url.startsWith('/api/git')) {
+          if (req.method !== 'POST') return json(405, { error: 'POST' });
+          let body = ''; for await (const c of req) body += c;
+          const { args } = JSON.parse(body || '{}');
+          if (!Array.isArray(args) || !args.every(a => typeof a === 'string')) return json(400, { error: 'args: string[]' });
+          return json(200, { cwd: root, args, ...(await runGit(root, args)) });
+        }
         if (req.method === 'GET') return json(200, { dir: root, books: await readArchive(root) });
         if (req.method === 'PUT') { let body = ''; for await (const c of req) body += c; return json(200, { ok: true, ...(await writeArchive(root, JSON.parse(body))) }); }
         json(405, { error: 'GET or PUT' });

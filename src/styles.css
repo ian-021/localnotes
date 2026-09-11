@@ -153,3 +153,4 @@ textarea { font: inherit; color: inherit; }
 .hover-row .muted { color: var(--muted, #8a877f); }
 .hover-foot { padding: 6px 12px 2px; color: var(--muted, #8a877f); font-size: 11px; cursor: pointer; border-top: 1px solid var(--line, #e6e3dc); margin-top: 4px; }
 .hover-foot:hover { color: var(--ink, #111); }
+

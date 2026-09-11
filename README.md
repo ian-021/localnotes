@@ -24,7 +24,13 @@ Point it at a dedicated git repo and commit there whenever you like:
 cd archive && git init && git add -A && git commit -m "notes"
 ```
 
-The app is the editor; it does not watch the folder. If you `git pull` new files, run `:reload`. Ids live in frontmatter so
+The app is the editor; it does not watch the folder. If you `git pull` new files, run `:reload`.
+
+You can also drive git from inside the app. `:git <args>` runs `git <args>` in the archive folder through the dev server, as
+you, with your ssh keys and config, so there is no login. Nothing opens: the result is one line in the status bar,
+`git push · ok · main -> main` or `git commit · failed · <first error line>`. `:commit [message]` does `git add -A`, `git commit -m` (default message: `notes · <date>`) and `git push` in one go;
+`:push`, `:pull` (reloads afterwards), `:status` and `:log` are shortcuts. Quotes group words: `:git commit -m "a message"`.
+Git is run with prompts disabled and a 30 s timeout, so anything that would ask a question fails instead of hanging. Ids live in frontmatter so
 links and threads survive renames. Without the dev server (a plain static build) the app falls back to `localStorage`; the
 status bar says `archive` or `local`.
 
@@ -45,7 +51,7 @@ bun run build    # static bundle in dist/
 `o` new item (INSERT mode) · in a thread `o` adds a thought after the one under the cursor and `a` replies beneath it (replies indent) · `v` visual line · `dd` delete · `u` undo · `yy` / `p` yank / paste (paste opens a buffer to check first) ·
 `Cmd-c` / `Cmd-v` copy / paste · `gg` / `G` · `gx` follow first `[link]` on the line · `/` search · `:` command · `\b` or `␣ee` sidebar · `?` help.
 
-Commands: `:q` `:new book <title>` `:quote` `:def <word>` `:page <n>` `:tag #name` `:go #name` `:vocab` `:ai` `:author <name>` `:theme dark|light` `:set nu` `:w` (write the archive now) `:reload` `:reset` (clears everything).
+Commands: `:q` `:new book <title>` `:quote` `:def <word>` `:page <n>` `:tag #name` `:go #name` `:vocab` `:ai` `:author <name>` `:theme dark|light` `:set nu` `:w` (write the archive now) `:reload` `:git <args>` `:commit [message]` `:push` `:pull` `:status` `:log` `:reset` (clears everything).
 
 ## All words
 
@@ -76,6 +82,9 @@ a word, a thought, new or existing — is edited in the same vim-style buffer, a
   `[…](` and opens completion for the tag name) · `o` swap ends · `Esc`.
 - `:w` writes, `:wq` (or `:x`) writes and closes, `:q` closes only if nothing changed since the last write, `:q!` discards.
   `:page <n>` works while editing an existing quote.
+
+A new book is the exception: `o` in the library opens two inline fields, *title* then *author* (`Enter` after each, empty
+author skips, `Title - Author` in the first fills both). Editing an existing book uses the buffer like everything else.
 
 What the lines mean: a **book** is *title* on line 1 and *author* on line 2 (`Title - Author` on one line also works); a
 **word** is the word on line 1 and its definition below; quotes and thoughts are free text. The short name in the sidebar is

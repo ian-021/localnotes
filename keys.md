@@ -50,7 +50,7 @@ quote and every thought under it). `Enter` on a word opens the word view. `Enter
 
 | Key | Where | Action |
 | --- | --- | --- |
-| `o` (or `O`) | library | new book |
+| `o` (or `O`) | library | new book: two inline fields, *title* then *author* (see below) |
 | `o` | book, quotes section | new quote |
 | `o` | book, vocab section | new word |
 | `o` | thread | new thought, placed right after the one under the cursor |
@@ -62,6 +62,14 @@ quote and every thought under it). `Enter` on a word opens the word view. `Enter
 
 New items open the buffer in INSERT mode so you can type straight away. Editing an existing item with `i` or `c` opens
 it in NORMAL mode so you can move around first.
+
+### New book
+
+A new book is the one thing not typed in the buffer. `o` in the library (or `:new book` with no title) opens a row with
+two fields. Type the title, `Enter`, type the author, `Enter`. `Enter` on an empty author skips it, `Esc` cancels, and
+typing `Title - Author` in the first field fills both at once. The fields take the same cursor and word shortcuts as the
+command line. `:new book <title>` creates the book directly, and editing an existing book (`i`, `Enter`) still uses the
+buffer: title on line 1, author on line 2.
 
 ### How to reply to a thought
 
@@ -102,7 +110,11 @@ The sidebar is read-only for deletion: delete books from the library view in the
 - `/` starts a search. The list filters as you type. `Enter` keeps the filter, `Esc` clears it. `n` reminds you what
   the current filter is.
 - `:` opens the command line. `Tab` completes a command name. `Enter` runs it, `Esc` cancels.
-- In both, `Ctrl-w` (or `Alt-Backspace`) deletes the last word and `Ctrl-u` (or `Cmd-Backspace`) clears the line.
+- In both, `←` / `→` move the cursor, `Home` / `End` (or `Cmd-←` / `Cmd-→`, `Ctrl-a` / `Ctrl-e`) jump to the ends,
+  `Alt-←` / `Alt-→` move by word. `Alt-Backspace` / `Ctrl-w` delete the word before the cursor, `Cmd-Backspace` /
+  `Ctrl-u` delete to the start, `Ctrl-k` to the end. `Delete` removes the character under the cursor.
+- On the command line `↑` / `↓` walk the history of commands you have run (kept across sessions). The line you were
+  typing is kept at the bottom of the history.
 
 | Command | Action |
 | --- | --- |
@@ -120,6 +132,10 @@ The sidebar is read-only for deletion: delete books from the library view in the
 | `:set nu` | toggle line numbers |
 | `:w` | write the archive to disk now |
 | `:reload` | reload the archive folder (after a `git pull`, for instance) |
+| `:git <args>` | run `git <args>` in the archive folder; the result is one line in the status bar |
+| `:commit [message]` | `git add -A`, `git commit -m`, `git push` in one go. Default message: `notes · <date>` |
+| `:push` / `:pull` | `git push` / `git pull` (pull reloads the archive afterwards) |
+| `:status` / `:log` | `git status --short --branch` / last 20 commits |
 | `:reset` | clear everything (`u` undoes it) |
 | `:help` | same as `?` |
 
@@ -218,6 +234,29 @@ The status bar says `archive` when the dev server is writing your Markdown folde
 With the archive, every change is written within half a second. `:w` forces a write now. The app does not watch the
 folder, so after pulling new files with git run `:reload`.
 
+## Git from inside the app
+
+The archive folder is a git repo of its own. `:git <args>` runs git there through the dev server, as you, with your
+ssh keys and git config, so nothing needs a login. Nothing opens and you stay where you are: while it runs the status
+bar says `git push…`, then it shows one line with the result:
+
+```
+git status · ok · main...origin/main · 2 changes
+git commit · ok · [main 9a1b2c3] finished chapter 3
+git push · ok · main -> main
+git commit · failed · error: pathspec 'git' did not match any file(s) known to git
+```
+
+An unquoted message after `-m` runs to the end of the line, so `:git commit -m finished chapter 3` works; quotes work too.
+Git runs with prompts disabled and a 30 second timeout, so a command that would ask a question (an https remote without a
+stored credential, say) fails with a message instead of hanging.
+
+The everyday flow is one command: `:commit finished chapter 3`. It flushes any pending write, stages everything, commits
+with that message (or `notes · <date>` if you give none) and pushes. The bar ends with `committed and pushed`, or with the
+step that failed. `:status` before, if you want to look. `↑` on the command line brings the last command back.
+
+Only the dev server has this. The static build (`local` in the status bar) has no archive and no git.
+
 ## Mouse
 
 Everything is also reachable with the mouse: click rows, books, tags, crumbs and popup entries; double-click a row to
@@ -226,10 +265,10 @@ open or edit it; the status bar has new / edit / del / undo / :cmd / ? / theme /
 ## A typical session
 
 1. `bun run dev`, open the app.
-2. `o` in the library, type `Deep Work - Cal Newport`, `Esc`, `:wq`.
+2. `o` in the library, type `Deep Work`, `Enter`, `Cal Newport`, `Enter`.
 3. `Enter` on the book, `o`, paste or type a quote, `Esc`, `:wq`. `:page 42` sets the page.
 4. `Enter` on the quote to open its thread. `o`, type a thought, `Esc`, `:wq`.
 5. Put the cursor on that thought and press `a` to reply to it. Type, `Esc`, `:wq`.
 6. `h` to go back to the quotes, `Ctrl-h` to the sidebar, `l` to unfold the book, `j` `Enter` to open its vocab.
 7. `:def equanimity`, type the definition on line 2, `Esc`, `:wq`. `Enter` on the word, then `:ai` to look it up.
-8. Everything is already in `archive/`. Commit it there whenever you like.
+8. Everything is already in `archive/`. `:commit reading notes` stages, commits and pushes it without leaving the app.
