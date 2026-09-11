@@ -1,6 +1,6 @@
 # localnotes
 
-A keyboard-driven, vim-flavoured reading journal: books → quotes → thoughts, plus a vocab list per book.
+A keyboard-driven, vim-flavoured reading journal: books → quotes → thoughts (and thoughts about thoughts, as deep as you like), plus a vocab list per book.
 Everything lives in a **archive**: a folder of Markdown files you can commit and push with git.
 
 ## The archive
@@ -11,7 +11,7 @@ archive/
     life-3-0/
       book.md                      # id, title, author, tags
       quotes/
-        intelligence-is-the.md     # "> quote", then "## thoughts" with one "### <time> {#id}" section each
+        intelligence-is-the.md     # "> quote", then "## thoughts": one "### <time> {#id}" section per thought; a reply is one level deeper (####)
       vocab/
         equanimity.md              # definition, then "## lookup" with the cached AI answer
 ```
@@ -40,9 +40,9 @@ bun run build    # static bundle in dist/
 
 ## Keys
 
-`h j k l` move within the focused pane · `Ctrl-h` / `Ctrl-l` switch between sidebar and main · `Enter` open/edit · `i` / `A` edit line with caret at end · `I` edit line with caret at start ·
+`h j k l` move within the focused pane · `Ctrl-h` / `Ctrl-l` switch between sidebar and main · `Enter` open (a thought: edit) · `i` / `c` edit in the buffer (NORMAL mode) · `a` / `A` edit, INSERT at end · `I` INSERT at start ·
 `Enter` on a book in the sidebar unfolds it into `quotes` and `vocab`; `Enter` on one of those opens just that section in the main pane (`l` unfolds, `h` folds / goes back to the book) ·
-`a` new thought line · `o` new item (long-form in a thread) · `v` visual line · `dd` delete · `u` undo · `yy` / `p` yank / paste ·
+`o` new item (INSERT mode) · in a thread `o` adds a thought after the one under the cursor and `a` replies beneath it (replies indent) · `v` visual line · `dd` delete · `u` undo · `yy` / `p` yank / paste (paste opens a buffer to check first) ·
 `Cmd-c` / `Cmd-v` copy / paste · `gg` / `G` · `gx` follow first `[link]` on the line · `/` search · `:` command · `\b` or `␣ee` sidebar · `?` help.
 
 Commands: `:q` `:new book <title>` `:quote` `:def <word>` `:page <n>` `:tag #name` `:go #name` `:vocab` `:ai` `:author <name>` `:theme dark|light` `:set nu` `:w` (write the archive now) `:reload` `:reset` (clears everything).
@@ -62,33 +62,38 @@ the word; `r` or `:ai` asks again. `q` / `h` goes back.
 Setup: `cp .env.example .env`, put your key in `VITE_OPENAI_API_KEY`, restart `bun run dev`. The key is read by Vite at build
 time and ends up in the client bundle, so only use this locally. `VITE_OPENAI_MODEL` overrides the model (default `gpt-5.4-mini`; reasoning models are sent `reasoning_effort: low`, older ones `temperature`).
 
-## Editing shortcuts (insert mode and the command line)
+## The buffer
 
-Mac: `⌥←` / `⌥→` word left / right · `⌘←` / `⌘→` line start / end · `⌥⌫` delete word back · `⌘⌫` delete to line start ·
-`⌥fn⌫` delete word forward · `⌘fn⌫` delete to line end. Vim / emacs: `Ctrl-w` delete word back · `Ctrl-u` delete to line
-start · `Ctrl-a` / `Ctrl-e` line start / end · `Ctrl-k` delete to line end. The long-form editor gets the Mac ones natively
-and adds `Ctrl-w` / `Ctrl-u`.
+There are two worlds: the lists (navigate, open, delete, yank) and the buffer (type). Every piece of text — a book, a quote,
+a word, a thought, new or existing — is edited in the same vim-style buffer, and nothing is written until you say so.
 
-## New book
+- NORMAL: `i a I A o O` insert · `h j k l` (`j` / `k` walk wrapped lines) `w b e 0 ^ $ gg G` move · `x X s S D C J` ·
+  operators `d c y` with any motion, doubled for the line (`dd cc yy`, also `dw cw d$ …`) or a text object (`ciw daw yi( di[ ci" dap …`) ·
+  `p` / `P` paste · `u` undo · `Ctrl-r` redo ·
+  `v` / `V` visual · `:` command. The cursor is a block on the current character.
+- INSERT: type; `Esc` back to NORMAL. `[` opens tag completion. Mac shortcuts (`⌥←` `⌘⌫` …) work natively, plus `Ctrl-w` / `Ctrl-u`.
+- VISUAL / V-LINE: motions extend the selection · text objects select (`viw vaw viW vip vi( va[ vi" …`) · `d` delete · `y` yank · `c` change · `t` tag the selection (wraps it in
+  `[…](` and opens completion for the tag name) · `o` swap ends · `Esc`.
+- `:w` writes, `:wq` (or `:x`) writes and closes, `:q` closes only if nothing changed since the last write, `:q!` discards.
+  `:page <n>` works while editing an existing quote.
 
-`o` in the library opens two fields, *title* then *author*: type the title, `Enter`, type the author, `Enter` (or `Enter` on an
-empty author to skip). Typing `Title - Author` in the first field fills both. The short name in the sidebar is derived from the
-title (`Life 3.0` → `life-3-0`) and follows title edits.
-
-## Long-form editor
-
-`o` in a thread opens a long-form thought in a modal, vim-like editor. It opens in INSERT mode; `Esc` returns to NORMAL mode
-without leaving. In NORMAL: `i a I A o O` insert, `h j k l w b e 0 ^ $ gg G` move, `x` / `dd` delete, `u` undo, `:` command.
-`:w` writes, `:wq` (or `:x`) writes and closes, `:q` closes only if nothing changed since the last write, `:q!` discards.
+What the lines mean: a **book** is *title* on line 1 and *author* on line 2 (`Title - Author` on one line also works); a
+**word** is the word on line 1 and its definition below; quotes and thoughts are free text. The short name in the sidebar is
+derived from the title (`Life 3.0` → `life-3-0`) and follows title edits. `:def <word>` opens a word buffer with the word
+already on line 1.
 
 ## Tags and links
 
-Write `[word]` inside any title, quote, thought, or definition to tag it. Typing `[` in insert mode opens a completion
-popup with every known tag. Links render in `#9E9EFF`; hover one to see everywhere that tag appears, click it to open the
-tag view. A book's `#tag` and a `[tag]` in text are the same tag.
+Write `[word]` inside any title, quote, thought, or definition to tag it with that word. To tag a span with a different
+name, write `[the children of our minds](ai)`: the span shows as the link and the tag name stays out of the way — it appears
+only when the mouse is over the link or the row is under the cursor. In the buffer the span is tinted and the `(ai)` part
+takes no room in the line: it floats as a small label above the span, shown while the cursor is inside the span or the
+mouse is over it. Moving the cursor through the `(ai)` characters walks through that label. Typing `[` or `](` in insert mode opens a completion popup with every
+known tag; in visual mode `t` wraps the selection and opens the same popup. Links render in `#9E9EFF`; hover one to see
+everywhere that tag appears, click it to open the tag view. A book's `#tag` and a `[tag]` in text are the same tag.
 
 ## Mouse
 
 Everything is reachable by mouse: click rows, books, tags, crumbs, and popup entries; double-click a row to open or edit
 it; the status bar has new / edit / del / undo / :cmd / ? / theme / sidebar actions, and the command line shows
-done / cancel / keep buttons for the current mode.
+write / write & close / close buttons while a buffer is open.

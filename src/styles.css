@@ -60,17 +60,31 @@ textarea { font: inherit; color: inherit; }
 .row-c { color: var(--muted, #8a877f); }
 .row-d { text-align: right; color: var(--muted, #8a877f); }
 .ph { color: var(--faint, #b5b2aa); font-style: italic; }
-.caret { display: inline-block; width: 8px; height: 14px; background: var(--ink, #111); vertical-align: -2px; margin-left: 1px; }
+.caret { background: var(--ink, #111); color: var(--bg, #fff); white-space: pre; }
 .tilde { grid-column: 1 / -1; color: var(--faint, #b5b2aa); font-size: 12px; padding: 8px 0 0 64px; }
 
 
-.long { flex: 1; min-height: 0; display: flex; flex-direction: column; padding-left: 64px; gap: 10px; }
-.long-label { color: var(--muted, #8a877f); font-size: 12px; }
-.long textarea.vnormal { caret-color: var(--link); }
-.long textarea {
-  flex: 1; resize: none; border: 0; outline: none; background: transparent; padding: 0;
-  font-size: 14px; line-height: 1.7; max-width: 72ch; text-wrap: pretty;
-}
+.long { flex: 1; min-height: 0; display: flex; flex-direction: column; padding-left: 64px; gap: 0; }
+.long-label { color: var(--muted, #8a877f); font-size: 12px; display: flex; justify-content: space-between; gap: 16px; max-width: calc(72ch + 3px); }
+/* the buffer: the textarea takes the keys but draws no text; the mirror (same metrics, on top, mouse-transparent) draws the
+   text, the block cursor, the visual selection and the tag marks. j / k ask the textarea itself where wrapped lines are. */
+.buf-wrap { position: relative; flex: 1; min-height: 0; display: flex; overflow: hidden; }
+.buf { font: inherit; font-size: 14px; line-height: 1.7; width: 100%; max-width: calc(72ch + 3px); margin: 0; padding: 12px 0 0; border: 0; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; tab-size: 4; }
+.long textarea.buf { flex: 1; resize: none; outline: none; background: transparent; color: transparent; caret-color: transparent; position: relative; z-index: 1; }
+.long textarea.vnormal::selection, .long textarea.vvisual::selection { background: transparent; }
+.buf.mirror { position: absolute; top: 0; left: 0; max-width: none; color: var(--ink, #111); pointer-events: none; height: auto; overflow: visible; z-index: 2; }
+.buf.mirror .sel { background: color-mix(in srgb, var(--ink, #111) 22%, transparent); }
+.buf.mirror .lw { position: relative; }
+.buf.mirror .bl { background: color-mix(in srgb, #a78bfa 13%, transparent); border-radius: 2px; }
+/* the (tag) is taken out of the line and floated above its span; it only shows while the cursor or the mouse is on the span */
+.buf.mirror .bt { display: none; position: absolute; left: 0; bottom: 100%; margin-bottom: -5px; font-size: 10px; line-height: 1; color: var(--muted, #8a877f); white-space: nowrap; pointer-events: none; }
+.buf.mirror .lw.on .bt { display: block; }
+.buf.mirror .cur { background: var(--ink, #111); color: var(--bg, #fff); border-radius: 0; }
+.buf.mirror .ic { position: relative; }
+.buf.mirror .ic::before { content: ''; position: absolute; left: -1px; top: 2px; bottom: 2px; width: 2px; background: var(--ink, #111); animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.link-tag { color: var(--muted, #8a877f); font-size: 11px; margin-left: 3px; display: none; }
+.link:hover .link-tag, .row.cur .link-tag { display: inline; }
 
 /* word detail */
 .word { flex: 1; min-height: 0; overflow: auto; padding-left: 64px; display: flex; flex-direction: column; gap: 16px; max-width: 78ch; }

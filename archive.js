@@ -24,8 +24,10 @@ const unique = (names, base) => { let n = base, i = 2; while (names.has(n)) n = 
 
 // ---- serialize
 const bookMd = (b, order) => front({ id: b.id, title: b.title, author: b.author, tags: b.tags.map(t => t.replace(/^#/, '')), order }) + `\n# ${b.title}\n${b.author ? `\n*${b.author}*\n` : ''}`;
+// thoughts nest: a reply to a thought is one heading level deeper (### → #### → …)
+const thoughtsMd = (list, depth) => list.map(t => `\n${'#'.repeat(depth)} ${iso(t.at)} {#${t.id}}\n${t.text}\n` + thoughtsMd(t.thoughts || [], depth + 1)).join('');
 const quoteMd = (q, order) => front({ id: q.id, page: q.page || undefined, order }) + '\n' + q.text.split('\n').map(l => '> ' + l).join('\n') + '\n' +
-  (q.thoughts.length ? '\n## thoughts\n' + q.thoughts.map(t => `\n### ${iso(t.at)} {#${t.id}}\n${t.text}\n`).join('') : '');
+  (q.thoughts.length ? '\n## thoughts\n' + thoughtsMd(q.thoughts, 3) : '');
 const vocabMd = (w, order) => front({ id: w.id, word: w.word, at: iso(w.at), order }) + '\n' + w.def + '\n' + (w.ai ? '\n## lookup\n```json\n' + JSON.stringify(w.ai, null, 2) + '\n```\n' : '');
 
 export const toFiles = books => {
@@ -44,12 +46,17 @@ const parseQuote = (text, id) => {
   const { meta, body } = parseFront(text);
   const [head, ...rest] = body.split(/^## thoughts\s*$/m);
   const qtext = head.split(/\r?\n/).filter(l => l.startsWith('>')).map(l => l.replace(/^>\s?/, '')).join('\n').trim();
-  const thoughts = [];
-  (rest.join('\n')).split(/^### /m).slice(1).forEach(chunk => {
-    const nl = chunk.indexOf('\n'), header = chunk.slice(0, nl < 0 ? chunk.length : nl), t = chunk.slice(nl + 1).trim();
-    const im = /\{#([^}]+)\}/.exec(header);
-    thoughts.push({ id: im ? im[1] : id(), at: ms(header.replace(/\{#[^}]+\}/, '').trim()), text: t });
+  const thoughts = [], stack = [];   // stack[d] = the latest thought at depth d; a heading's depth is its number of # minus 3
+  let cur = null;
+  rest.join('\n').split(/\r?\n/).forEach(line => {
+    const hm = /^(#{3,}) (.*)$/.exec(line);
+    if (!hm) { if (cur) cur.lines.push(line); return; }
+    const depth = Math.min(hm[1].length - 3, stack.length), im = /\{#([^}]+)\}/.exec(hm[2]);
+    cur = { id: im ? im[1] : id(), at: ms(hm[2].replace(/\{#[^}]+\}/, '').trim()), lines: [], thoughts: [] };
+    (depth ? stack[depth - 1].thoughts : thoughts).push(cur); stack.length = depth; stack[depth] = cur;
   });
+  const finish = list => list.forEach(t => { t.text = t.lines.join('\n').trim(); delete t.lines; finish(t.thoughts); });
+  finish(thoughts);
   return { id: meta.id || id(), text: qtext, page: meta.page ? Number(meta.page) : null, thoughts, order: Number(meta.order) || 0 };
 };
 const parseVocab = (text, name, id) => {
